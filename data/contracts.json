@@ -1,0 +1,19 @@
+[
+  {
+    "contractId": "CDEMOSAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "repoUrl": "https://github.com/your-org/demo-safe-token",
+    "commitSha": "abc123def456",
+    "contractPath": "contracts/token",
+    "crateName": "token"
+  },
+  {
+    "contractId": "CDEMODAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  {
+    "contractId": "CDEMOBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "repoUrl": "https://github.com/your-org/demo-lending",
+    "commitSha": "deadbeef0000",
+    "contractPath": "contracts/lending",
+    "crateName": "lending"
+  }
+]

@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg: 15 23 42;       /* slate-900 */
+    --surface: 30 41 59;  /* slate-800 */
+    --border: 51 65 85;   /* slate-700 */
+    --text: 248 250 252;  /* slate-50 */
+    --muted: 148 163 184; /* slate-400 */
+  }
+
+  body {
+    @apply bg-slate-900 text-slate-50 antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  /* Monospace for contract IDs and hashes */
+  .mono {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+  }
+}
+
+@layer utilities {
+  .truncate-id {
+    @apply truncate max-w-[220px] sm:max-w-xs;
+  }
+}

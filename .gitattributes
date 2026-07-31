@@ -1,0 +1,10 @@
+# Normalise line endings to LF in the repo on all platforms.
+* text=auto eol=lf
+
+# Shell scripts must always be LF (CRLF breaks bash).
+*.sh text eol=lf
+
+# Binary files — do not touch line endings.
+*.wasm binary
+*.png  binary
+*.jpg  binary

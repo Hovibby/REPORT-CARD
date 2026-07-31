@@ -1,0 +1,31 @@
+{
+  "name": "report-card",
+  "version": "0.1.0",
+  "description": "Report Card — a safety registry for Soroban smart contracts",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "sdk",
+    "engine",
+    "web"
+  ],
+  "scripts": {
+    "build:contracts": "cd contracts/report_card && stellar contract build",
+    "build:engine": "npm run build --workspace=engine",
+    "build:web": "npm run build --workspace=web",
+    "build:sdk": "npm run build --workspace=sdk",
+    "build": "npm run build:engine && npm run build:sdk && npm run build:web",
+    "dev:web": "npm run dev --workspace=web",
+    "dev:engine": "npm run dev --workspace=engine",
+    "lint": "npm run lint --workspaces --if-present",
+    "deploy": "bash scripts/deploy.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/report_card"
+  },
+  "license": "Apache-2.0"
+}

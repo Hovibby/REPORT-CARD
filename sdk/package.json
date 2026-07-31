@@ -1,0 +1,40 @@
+{
+  "name": "@reportcard/sdk",
+  "version": "0.1.0",
+  "description": "One-line isSafe() client for the Report Card Soroban safety registry",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@stellar/stellar-sdk": ">=16"
+  },
+  "peerDependenciesMeta": {
+    "@stellar/stellar-sdk": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@reportcard/types": "*"
+  },
+  "devDependencies": {
+    "@stellar/stellar-sdk": "16.2.0",
+    "@types/node": "20.14.0",
+    "typescript": "5.4.5"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/report_card"
+  },
+  "keywords": ["stellar", "soroban", "smart-contracts", "security", "safety"]
+}

@@ -1,0 +1,31 @@
+[package]
+name        = "report_card"
+version     = "0.1.0"
+edition     = "2021"
+description = "Report Card — on-chain safety registry for Soroban smart contracts."
+license     = "Apache-2.0"
+repository  = "https://github.com/your-org/report_card"
+publish     = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Export the testutils (needed by the soroban test harness).
+testutils = ["soroban-sdk/testutils"]
+
+[dependencies]
+soroban-sdk = { version = "21.7.6", features = [] }
+
+[dev-dependencies]
+soroban-sdk = { version = "21.7.6", features = ["testutils"] }
+
+[profile.release]
+opt-level     = "z"
+overflow-checks = true
+debug         = false
+strip         = "symbols"
+debug-assertions = false
+panic         = "abort"
+codegen-units = 1
+lto           = true

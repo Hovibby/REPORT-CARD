@@ -1,0 +1,25 @@
+{
+  "name": "@reportcard/engine",
+  "version": "0.1.0",
+  "description": "Off-chain analysis engine for the Report Card Soroban safety registry",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@reportcard/types": "*",
+    "@stellar/stellar-sdk": "16.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.0",
+    "tsx": "4.15.7",
+    "typescript": "5.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
