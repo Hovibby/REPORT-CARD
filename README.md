@@ -1,12 +1,8 @@
-# <p align="center">📋 Report Card</p>
+# 📋 Report Card
 
-<p align="center">
-  <img src="assets/logo.svg" alt="Report Card — Soroban Smart Contract Safety Registry" width="420"/>
-</p>
+<img src="assets/logo.svg" alt="Report Card — Soroban Smart Contract Safety Registry" width="420"/>
 
-<p align="center">
-  <strong>A safety registry for Soroban smart contracts — so wallets can warn users before they sign.</strong>
-</p>
+> **A safety registry for Soroban smart contracts — so wallets can warn users before they sign.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Data: CC-BY-4.0](https://img.shields.io/badge/Data-CC--BY--4.0-green.svg)](LICENSE)
