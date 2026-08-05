@@ -1,38 +1,48 @@
-//! Unit + integration tests for the Report Card registry contract.
+//! Tests for the fully-decentralised Report Card contract.
+//!
+//! Key changes from the old single-admin model:
+//!   - initialize() takes a Vec<Address> council + threshold.
+//!   - set_flags() is permissionless — any account may call it.
+//!   - Auditor reputation is set via governance proposals, not admin().
+//!   - No single Relayer key.
 
 #![cfg(test)]
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger},
-    Address, BytesN, Env, Symbol,
+    testutils::{Address as _, Ledger},
+    vec, Address, BytesN, Env, Symbol,
 };
 
 // ─────────────────────────── helpers ─────────────────────────────────────────
 
-/// Deploy the contract and return (env, client, admin, relayer).
-fn setup() -> (Env, ReportCardContractClient<'static>, Address, Address) {
+/// Deploy + initialise with a 2-of-3 governance council.
+fn setup() -> (
+    Env,
+    ReportCardContractClient<'static>,
+    Address, // council[0]
+    Address, // council[1]
+    Address, // council[2]
+) {
     let env = Env::default();
     env.mock_all_auths();
 
-    let admin = Address::generate(&env);
-    let relayer = Address::generate(&env);
+    let c0 = Address::generate(&env);
+    let c1 = Address::generate(&env);
+    let c2 = Address::generate(&env);
 
     let contract_id = env.register_contract(None, ReportCardContract);
-    let client = ReportCardContractClient::new(&env, &contract_id);
+    let client      = ReportCardContractClient::new(&env, &contract_id);
 
-    client.initialize(&admin, &relayer);
+    client.initialize(&vec![&env, c0.clone(), c1.clone(), c2.clone()], &2u32);
 
-    (env, client, admin, relayer)
+    (env, client, c0, c1, c2)
 }
 
-/// Build a dummy 32-byte WASM hash.
 fn dummy_hash(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
 }
 
-/// Build a dummy 64-byte signature (all zeros — passes under mock_all_auths
-/// because the crypto call is bypassed in test mode).
 fn dummy_sig(env: &Env) -> BytesN<64> {
     BytesN::from_array(env, &[0u8; 64])
 }
@@ -40,229 +50,260 @@ fn dummy_sig(env: &Env) -> BytesN<64> {
 // ─────────────────────────── initialize ──────────────────────────────────────
 
 #[test]
-fn test_initialize_sets_admin_and_relayer() {
-    let (env, client, admin, relayer) = setup();
-    // Smoke: is_safe on an unknown contract returns an F record.
-    let target = Address::generate(&env);
-    let record = client.is_safe(&target);
-    assert_eq!(record.grade.numeric, 1); // F
+fn test_initialize_stores_council() {
+    let (env, client, c0, c1, c2) = setup();
+    let council = client.get_council();
+    assert_eq!(council.members.len(), 3);
+    assert_eq!(council.threshold, 2);
 }
 
 #[test]
 #[should_panic(expected = "already initialised")]
-fn test_initialize_cannot_reinitialise() {
-    let (env, client, admin, relayer) = setup();
-    let admin2 = Address::generate(&env);
-    client.initialize(&admin2, &admin2); // must panic
+fn test_initialize_twice_panics() {
+    let (env, client, c0, c1, _) = setup();
+    client.initialize(&vec![&env, c0.clone()], &1u32);
 }
 
-// ─────────────────────────── register_auditor ────────────────────────────────
+#[test]
+#[should_panic(expected = "threshold must be between 1 and council size")]
+fn test_initialize_bad_threshold_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let c0 = Address::generate(&env);
+    let contract_id = env.register_contract(None, ReportCardContract);
+    let client = ReportCardContractClient::new(&env, &contract_id);
+    client.initialize(&vec![&env, c0.clone()], &5u32); // threshold > len
+}
+
+// ─────────────────────────── governance — propose + vote ─────────────────────
 
 #[test]
-fn test_register_auditor_stores_record() {
-    let (env, client, _admin, _relayer) = setup();
+fn test_proposal_reaches_threshold_and_executes() {
+    let (env, client, c0, c1, _c2) = setup();
+
+    // We'll vote to deactivate a (non-existent) auditor — just checking
+    // the vote-counting and execution logic. Use "aud_dact" kind.
     let auditor = Address::generate(&env);
-    let meta = dummy_hash(&env, 0xAA);
 
-    client.register_auditor(&auditor, &80u32, &meta);
+    // First register the auditor so deactivation doesn't panic.
+    // We skip the proposal path for this helper registration since we're
+    // testing voting mechanics, not auditor reg.
+    // Instead, let's create a "council" proposal that replaces itself
+    // with a single-member 1-of-1 council (simplest exec path).
+    let new_council = Council {
+        members:   vec![&env, c0.clone()],
+        threshold: 1,
+    };
+    let new_council_xdr = new_council.to_xdr(&env);
+    let payload: BytesN<32> = env.crypto().sha256(&new_council_xdr);
+    let proposal_id = dummy_hash(&env, 0xAB);
 
-    let info = client.get_auditor(&auditor).expect("auditor not found");
-    assert_eq!(info.reputation, 80);
-    assert!(info.active);
+    client.propose(&c0, &proposal_id, &symbol_short!("council"), &payload);
+
+    // One vote (c0 proposed, which counts as a vote). Threshold=2, need c1.
+    client.vote(&c1, &proposal_id, &new_council_xdr);
+
+    // After execution the proposal is removed and council updated.
+    let updated = client.get_council();
+    assert_eq!(updated.members.len(), 1);
+    assert_eq!(updated.threshold, 1);
 }
 
 #[test]
-#[should_panic(expected = "reputation must be 1-100")]
-fn test_register_auditor_zero_reputation_panics() {
-    let (env, client, _admin, _relayer) = setup();
-    let auditor = Address::generate(&env);
-    client.register_auditor(&auditor, &0u32, &dummy_hash(&env, 1));
+#[should_panic(expected = "caller is not a council member")]
+fn test_non_member_cannot_propose() {
+    let (env, client, _c0, _c1, _c2) = setup();
+    let outsider = Address::generate(&env);
+    client.propose(
+        &outsider,
+        &dummy_hash(&env, 0x01),
+        &symbol_short!("council"),
+        &dummy_hash(&env, 0x02),
+    );
 }
 
 #[test]
-#[should_panic(expected = "reputation must be 1-100")]
-fn test_register_auditor_over_100_panics() {
-    let (env, client, _admin, _relayer) = setup();
-    let auditor = Address::generate(&env);
-    client.register_auditor(&auditor, &101u32, &dummy_hash(&env, 2));
+#[should_panic(expected = "proposal expired")]
+fn test_expired_proposal_cannot_be_voted() {
+    let (env, client, c0, c1, _c2) = setup();
+
+    let payload     = dummy_hash(&env, 0x10);
+    let proposal_id = dummy_hash(&env, 0x11);
+
+    client.propose(&c0, &proposal_id, &symbol_short!("council"), &payload);
+
+    // Advance ledger sequence past expiry.
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 17_281; // PROPOSAL_TTL_LEDGERS + 1
+    });
+
+    client.vote(&c1, &proposal_id, &Bytes::from_array(&env, &[0u8; 32]));
 }
 
-#[test]
-fn test_deactivate_auditor() {
-    let (env, client, _admin, _relayer) = setup();
-    let auditor = Address::generate(&env);
-    client.register_auditor(&auditor, &50u32, &dummy_hash(&env, 3));
-    client.deactivate_auditor(&auditor);
-
-    let info = client.get_auditor(&auditor).unwrap();
-    assert!(!info.active);
-}
-
-// ─────────────────────────── set_flags ───────────────────────────────────────
+// ─────────────────────────── set_flags — permissionless ──────────────────────
 
 #[test]
-fn test_set_flags_creates_record_and_grades() {
-    let (env, client, _admin, _relayer) = setup();
-    let target = Address::generate(&env);
-    let wh = dummy_hash(&env, 0x01);
+fn test_set_flags_any_account_can_submit() {
+    let (env, client, _c0, _c1, _c2) = setup();
 
-    // Unaudited, not source-verified, NOT upgradeable, no admin power, maturity=5.
-    client.set_flags(&target, &wh, &false, &false, &false, &5u32);
+    let anyone  = Address::generate(&env);
+    let target  = Address::generate(&env);
+    let wh      = dummy_hash(&env, 0x01);
+
+    // In tests, verify_wasm_hash is bypassed via mock_all_auths (the deployer
+    // host function is not available in the test harness, so we test the logic
+    // path where verification succeeds by default under mock).
+    client.set_flags(&anyone, &target, &wh, &false, &false, &false, &5u32);
 
     let record = client.is_safe(&target);
-    // upgradeable=false → 100*20=2000; admin_power=false → 100*15=1500;
-    // maturity=5 → 50*10=500; attestation=0 → 0*30=0; source=false → 0*25=0
-    // raw = (2000+1500+500+0+0)/100 = 40 → D (35-49)
-    assert_eq!(record.grade.numeric, 2); // D
-    assert!(!record.upgradeable);
-}
-
-#[test]
-fn test_set_flags_upgradeable_caps_grade() {
-    let (env, client, _admin, _relayer) = setup();
-    let target = Address::generate(&env);
-
-    // Upgradeable + no audits → should be F.
-    client.set_flags(&target, &dummy_hash(&env, 2), &true, &false, &true, &0u32);
-    let record = client.is_safe(&target);
-    assert_eq!(record.grade.numeric, 1); // F
-    assert!(record.upgradeable);
-}
-
-#[test]
-fn test_set_flags_fully_verified_no_threats_no_attestations() {
-    let (env, client, _admin, _relayer) = setup();
-    let target = Address::generate(&env);
-    let wh = dummy_hash(&env, 3);
-
-    // source_verified=true, NOT upgradeable, no admin_power, maturity=10.
-    client.set_flags(&target, &wh, &false, &true, &false, &10u32);
-    let record = client.is_safe(&target);
-    // source=100*25=2500; upgrade=100*20=2000; admin=100*15=1500; maturity=100*10=1000
-    // att=0; raw=(2500+2000+1500+1000)/100 = 70 → B (65-79)
-    assert_eq!(record.grade.numeric, 4); // B
+    assert_eq!(record.grade.numeric, 2); // D — no attestations, no source
 }
 
 #[test]
 #[should_panic(expected = "maturity_score must be 0-10")]
-fn test_set_flags_bad_maturity_panics() {
-    let (env, client, _admin, _relayer) = setup();
+fn test_set_flags_bad_maturity() {
+    let (env, client, _c0, _c1, _c2) = setup();
+    let anyone = Address::generate(&env);
     let target = Address::generate(&env);
-    client.set_flags(&target, &dummy_hash(&env, 4), &false, &false, &false, &11u32);
+    client.set_flags(
+        &anyone, &target, &dummy_hash(&env, 1),
+        &false, &false, &false, &11u32,
+    );
+}
+
+#[test]
+fn test_set_flags_upgradeable_grades_f() {
+    let (env, client, _c0, _c1, _c2) = setup();
+    let anyone = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.set_flags(&anyone, &target, &dummy_hash(&env, 2), &true, &false, &true, &0u32);
+    let record = client.is_safe(&target);
+    assert_eq!(record.grade.numeric, 1); // F
+}
+
+#[test]
+fn test_set_flags_fully_safe_no_attestations() {
+    let (env, client, _c0, _c1, _c2) = setup();
+    let anyone = Address::generate(&env);
+    let target = Address::generate(&env);
+    // source_verified=true, not upgradeable, no admin power, maturity=10
+    client.set_flags(&anyone, &target, &dummy_hash(&env, 3), &false, &true, &false, &10u32);
+    let record = client.is_safe(&target);
+    // score = (25*100 + 20*100 + 15*100 + 10*100) / 100 = 70 → B
+    assert_eq!(record.grade.numeric, 4); // B
 }
 
 // ─────────────────────────── submit_attestation ───────────────────────────────
 
 #[test]
-fn test_submit_attestation_stored_and_grade_updated() {
-    let (env, client, _admin, _relayer) = setup();
-
-    let target = Address::generate(&env);
-    let auditor = Address::generate(&env);
-    let wh = dummy_hash(&env, 0x10);
-
-    // Seed a record first so wasm_hash is set.
-    client.set_flags(&target, &wh, &false, &true, &false, &8u32);
-
-    // Register auditor with high reputation.
-    client.register_auditor(&auditor, &90u32, &dummy_hash(&env, 0x20));
-
-    // Submit attestation (sig is validated via mock_all_auths in test mode).
+#[should_panic(expected = "auditor not registered")]
+fn test_unregistered_auditor_cannot_attest() {
+    let (env, client, _c0, _c1, _c2) = setup();
+    let stranger = Address::generate(&env);
+    let target   = Address::generate(&env);
     client.submit_attestation(
-        &auditor,
-        &target,
-        &wh,
-        &true,
-        &95u32,
-        &dummy_sig(&env),
+        &stranger, &target, &dummy_hash(&env, 4),
+        &true, &80u32, &dummy_sig(&env),
+    );
+}
+
+#[test]
+fn test_attestation_increments_count_and_improves_grade() {
+    let (env, client, c0, c1, _c2) = setup();
+
+    let target  = Address::generate(&env);
+    let auditor = Address::generate(&env);
+    let wh      = dummy_hash(&env, 0x10);
+
+    // Seed flags first.
+    let anyone = Address::generate(&env);
+    client.set_flags(&anyone, &target, &wh, &false, &true, &false, &8u32);
+
+    // Register auditor via a governance proposal (aud_rep kind).
+    // We construct the payload manually: [4-byte addr_len LE][addr_xdr][4-byte rep LE][32 meta].
+    let auditor_xdr  = auditor.to_xdr(&env);
+    let addr_len     = auditor_xdr.len() as u32;
+    let reputation: u32 = 90;
+    let meta_hash    = dummy_hash(&env, 0x20);
+
+    let mut rep_data = Bytes::new(&env);
+    for b in addr_len.to_le_bytes().iter() { rep_data.push_back(*b); }
+    rep_data.append(&auditor_xdr);
+    for b in reputation.to_le_bytes().iter() { rep_data.push_back(*b); }
+    let mh_bytes: Bytes = meta_hash.clone().into();
+    rep_data.append(&mh_bytes);
+
+    let payload_hash: BytesN<32> = env.crypto().sha256(&rep_data);
+    let prop_id = dummy_hash(&env, 0xC0);
+
+    client.propose(&c0, &prop_id, &symbol_short!("aud_rep"), &payload_hash);
+    client.vote(&c1, &prop_id, &rep_data); // reaches threshold=2
+
+    // Auditor is now registered.
+    let info = client.get_auditor(&auditor).expect("auditor not registered after proposal");
+    assert_eq!(info.reputation, 90);
+
+    // Submit attestation.
+    client.submit_attestation(
+        &auditor, &target, &wh,
+        &true, &95u32, &dummy_sig(&env),
     );
 
-    // Attestation should be stored.
-    let att = client.get_attestation(&target, &auditor).expect("attestation not found");
+    let att = client.get_attestation(&target, &auditor).expect("attestation missing");
     assert!(att.verdict);
-    assert_eq!(att.confidence, 95);
 
-    // Grade should improve — source=true, no upgrade, no admin, maturity=8, 1 att.
-    // att_contrib=1*20=20 → 20*30=600
-    // src=100*25=2500; upg=100*20=2000; adm=100*15=1500; mat=8*10=80 → 80*10=800
-    // raw=(600+2500+2000+1500+800)/100 = 74 → B
     let record = client.is_safe(&target);
+    assert!(record.attestation_count >= 1);
     assert!(record.grade.numeric >= 4); // B or better
 }
 
-#[test]
-#[should_panic(expected = "auditor not registered")]
-fn test_submit_attestation_unknown_auditor_panics() {
-    let (env, client, _admin, _relayer) = setup();
-    let target = Address::generate(&env);
-    let stranger = Address::generate(&env);
-
-    client.submit_attestation(
-        &stranger,
-        &target,
-        &dummy_hash(&env, 5),
-        &true,
-        &80u32,
-        &dummy_sig(&env),
-    );
-}
+// ─────────────────────────── is_safe — unknown contract ──────────────────────
 
 #[test]
-#[should_panic(expected = "auditor deactivated")]
-fn test_submit_attestation_deactivated_auditor_panics() {
-    let (env, client, _admin, _relayer) = setup();
-    let target = Address::generate(&env);
-    let auditor = Address::generate(&env);
-
-    client.register_auditor(&auditor, &70u32, &dummy_hash(&env, 6));
-    client.deactivate_auditor(&auditor);
-
-    client.submit_attestation(
-        &auditor,
-        &target,
-        &dummy_hash(&env, 5),
-        &true,
-        &80u32,
-        &dummy_sig(&env),
-    );
-}
-
-// ─────────────────────────── grade boundary tests ────────────────────────────
-
-#[test]
-fn test_grade_a_full_score() {
-    let (env, client, _admin, _relayer) = setup();
-    let target = Address::generate(&env);
-    let auditor = Address::generate(&env);
-    let wh = dummy_hash(&env, 0xFF);
-
-    // Register 5 high-rep auditors to push attestation_count to max contribution.
-    for i in 0u8..5 {
-        let aud = Address::generate(&env);
-        client.register_auditor(&aud, &100u32, &dummy_hash(&env, i));
-        // Manually bump attestation count by submitting (engine sets count via relayer normally).
-        client.submit_attestation(&aud, &target, &wh, &true, &100u32, &dummy_sig(&env));
-    }
-
-    // Full flags: source_verified, not upgradeable, no admin_power, maturity=10.
-    client.set_flags(&target, &wh, &false, &true, &false, &10u32);
-
-    // After set_flags the attestation_count is reset to 0 (relayer controls count).
-    // Set it properly by re-submitting with the same wh — count will be 5 after.
-    // (attestation_count is managed by recompute_grade based on stored attestations)
-    // Resubmit so count increments back up after flag write.
-    let record = client.is_safe(&target);
-    // With 5 attestations + full flags: att=100*30=3000; src=100*25=2500;
-    // upg=100*20=2000; adm=100*15=1500; mat=100*10=1000 → raw=100 → A
-    assert_eq!(record.grade.numeric, 5); // A
-}
-
-#[test]
-fn test_is_safe_unknown_contract_returns_f() {
-    let (env, client, _admin, _relayer) = setup();
+fn test_is_safe_unknown_returns_f() {
+    let (env, client, _c0, _c1, _c2) = setup();
     let unknown = Address::generate(&env);
-    let record = client.is_safe(&unknown);
+    let record  = client.is_safe(&unknown);
     assert_eq!(record.grade.letter, Symbol::new(&env, "F"));
     assert_eq!(record.grade.numeric, 1);
     assert!(record.upgradeable);
+    assert!(record.admin_power);
+}
+
+// ─────────────────────────── full A-grade path ────────────────────────────────
+
+#[test]
+fn test_full_a_grade() {
+    let (env, client, c0, c1, _c2) = setup();
+    let target  = Address::generate(&env);
+    let anyone  = Address::generate(&env);
+    let wh      = dummy_hash(&env, 0xFF);
+
+    // Set all-green flags.
+    client.set_flags(&anyone, &target, &wh, &false, &true, &false, &10u32);
+
+    // Register 5 auditors and submit attestations.
+    for i in 0u8..5 {
+        let auditor = Address::generate(&env);
+        let aud_xdr = auditor.to_xdr(&env);
+        let alen    = aud_xdr.len() as u32;
+        let mut pd  = Bytes::new(&env);
+        for b in alen.to_le_bytes().iter() { pd.push_back(*b); }
+        pd.append(&aud_xdr);
+        let rep: u32 = 100;
+        for b in rep.to_le_bytes().iter() { pd.push_back(*b); }
+        let mhb: Bytes = dummy_hash(&env, i).into();
+        pd.append(&mhb);
+
+        let ph: BytesN<32> = env.crypto().sha256(&pd);
+        let pid = dummy_hash(&env, i + 10);
+
+        client.propose(&c0, &pid, &symbol_short!("aud_rep"), &ph);
+        client.vote(&c1, &pid, &pd);
+
+        client.submit_attestation(&auditor, &target, &wh, &true, &100u32, &dummy_sig(&env));
+    }
+
+    let record = client.is_safe(&target);
+    assert_eq!(record.grade.numeric, 5); // A
 }

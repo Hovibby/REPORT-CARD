@@ -1,20 +1,29 @@
 /**
- * @reportcard/sdk — one-line isSafe() client for the Report Card registry.
+ * @reportcard/sdk — Stellar-native safety client for the Report Card registry.
  *
- * Wallet pre-sign hook (the integration promise from the spec):
+ * DECENTRALISATION:
+ *   - isSafe()       — pure read, no keys, no auth.
+ *   - submitFlags()  — permissionless write; any wallet can submit WASM
+ *                      analysis.  The on-chain contract verifies the WASM
+ *                      hash against ledger state, so no trust in the caller.
+ *   - No privileged keys.  No Docker.  No off-chain database.
+ *
+ * Quick start:
  *
  *   import { ReportCard } from '@reportcard/sdk';
- *   const rc = new ReportCard({ network: 'testnet' });
- *   const g  = await rc.isSafe(contractId);
- *   if (g.grade <= 'D' || g.upgradeable) showWarning(g);
  *
- * The SDK supports two transport modes:
- *   - 'rpc'  — calls the Soroban RPC directly (requires @stellar/stellar-sdk)
- *   - 'http' — calls the /api/safety endpoint of a deployed dashboard instance
- *              (no Stellar SDK dependency; works in any JS runtime)
+ *   // Read (no wallet needed)
+ *   const rc = new ReportCard({ network: 'testnet', registryContractId: 'C…' });
+ *   const g  = await rc.isSafe(contractId);
+ *   if (g.gradeNumeric <= 2 || g.upgradeable) showWarning(g);
+ *
+ *   // Write — any wallet, no admin
+ *   const tx = await rc.buildSubmitFlagsXdr(flags);
+ *   const { signedTxXdr } = await wallet.signTransaction(tx, { ... });
+ *   const hash = await rc.sendSignedXdr(signedTxXdr);
  */
 
-// All shared types come from @reportcard/types — the single source of truth.
+// ── re-export shared types ────────────────────────────────────────────────────
 export type {
   GradeLetter,
   GradeNumeric,
@@ -25,133 +34,179 @@ export type {
 
 import type { GradeLetter, GradeNumeric, StellarNetwork } from "@reportcard/types";
 
-// ─────────────────────────── SDK-specific types ───────────────────────────────
+// ─────────────────────────── SDK types ───────────────────────────────────────
 
-/**
- * Enriched result returned by isSafe(). Extends SafetyRecord with SDK
- * conveniences: contractId, a flat grade letter/numeric, and an explanation.
- */
 export interface SafetyResult {
-  contractId: string;
-  /** Letter grade: A | B | C | D | F */
-  grade: GradeLetter;
-  /** Numeric equivalent: A=5 … F=1. Use this for numeric comparisons. */
-  gradeNumeric: GradeNumeric;
-  /** Raw weighted score, 0–100. */
-  score: number;
-  upgradeable: boolean;
-  sourceVerified: boolean;
-  adminPower: boolean;
+  contractId:       string;
+  grade:            GradeLetter;
+  /** A=5 … F=1 — use this for numeric comparisons. */
+  gradeNumeric:     GradeNumeric;
+  score:            number;
+  upgradeable:      boolean;
+  sourceVerified:   boolean;
+  adminPower:       boolean;
   attestationCount: number;
-  wasmHash: string;
-  maturityScore: number;
-  /** Human-readable summary of the main risk factors. */
-  explanation: string;
-  /** Full on-chain record for advanced use. */
-  raw: unknown;
+  wasmHash:         string;
+  maturityScore:    number;
+  explanation:      string;
+  raw:              unknown;
+}
+
+export interface SubmitFlagsInput {
+  /** Account that will sign and pay the transaction fee (any funded account). */
+  submitterAddress:  string;
+  /** Target contract being analysed. */
+  contractId:        string;
+  /** Hex SHA-256 of the deployed WASM (64 chars). */
+  wasmHash:          string;
+  upgradeable:       boolean;
+  sourceVerified:    boolean;
+  adminPower:        boolean;
+  /** 0–10 derived from age + distinct callers. */
+  maturityScore:     number;
 }
 
 export interface ReportCardOptions {
-  /** Stellar network to target. Default: 'testnet'. */
-  network?: StellarNetwork;
-
+  network?:             StellarNetwork;
+  /** Soroban RPC URL. Defaults to public SDF testnet endpoint. */
+  rpcUrl?:              string;
+  /** Deployed registry contract ID (C…). Required for all calls. */
+  registryContractId?:  string;
   /**
-   * Transport mode.
-   * 'rpc'  — direct Soroban RPC (requires stellar-sdk peer dep)
-   * 'http' — REST call to the dashboard API (no extra deps)
-   * Default: 'http' when apiUrl is set, otherwise 'rpc'.
+   * HTTP transport: base URL of a deployed dashboard instance.
+   * Use this for environments where @stellar/stellar-sdk is not available.
    */
-  transport?: "rpc" | "http";
-
-  /**
-   * Base URL of the deployed Report Card dashboard.
-   * Used when transport='http'.
-   * Example: 'https://reportcard.stellar.example.com'
-   */
-  apiUrl?: string;
-
-  /**
-   * Soroban RPC URL.
-   * Used when transport='rpc'.
-   * Default: public testnet RPC.
-   */
-  rpcUrl?: string;
-
-  /**
-   * Deployed Report Card registry contract ID.
-   * Required when transport='rpc'.
-   */
-  registryContractId?: string;
+  apiUrl?:              string;
+  transport?:           "rpc" | "http";
 }
 
 const DEFAULT_RPC: Record<string, string> = {
-  testnet: "https://soroban-testnet.stellar.org",
-  mainnet: "https://mainnet.sorobanrpc.com",
+  testnet:   "https://soroban-testnet.stellar.org",
+  mainnet:   "https://mainnet.sorobanrpc.com",
   futurenet: "https://rpc-futurenet.stellar.org",
 };
 
-// ─────────────────────────── SDK class ───────────────────────────────────────
+// ─────────────────────────── ReportCard class ────────────────────────────────
 
 export class ReportCard {
-  private opts: Required<
-    Pick<ReportCardOptions, "network" | "transport">
-  > &
-    ReportCardOptions;
+  private opts: Required<Pick<ReportCardOptions, "network" | "transport">>
+    & ReportCardOptions;
 
   constructor(options: ReportCardOptions = {}) {
-    const network = options.network ?? "testnet";
-    const transport =
-      options.transport ??
-      (options.apiUrl ? "http" : "rpc");
-
+    const network   = options.network   ?? "testnet";
+    const transport = options.transport ?? (options.apiUrl ? "http" : "rpc");
     this.opts = { ...options, network, transport };
   }
 
-  /**
-   * Fetch the safety record for a Soroban contract.
-   *
-   * @param contractId  56-character Stellar contract ID (starts with C)
-   * @returns           SafetyResult with grade, flags, and explanation
-   */
+  // ── read (no wallet required) ─────────────────────────────────────────────
+
   async isSafe(contractId: string): Promise<SafetyResult> {
-    switch (this.opts.transport) {
-      case "http":
-        return this._fetchHttp(contractId);
-      case "rpc":
-        return this._fetchRpc(contractId);
-    }
+    return this.opts.transport === "http"
+      ? this._fetchHttp(contractId)
+      : this._fetchRpc(contractId);
   }
 
-  // ── HTTP transport ──────────────────────────────────────────────────────
+  // ── permissionless write — build unsigned XDR ─────────────────────────────
 
-  private async _fetchHttp(contractId: string): Promise<SafetyResult> {
-    const base = (this.opts.apiUrl ?? "").replace(/\/$/, "");
-    const url = `${base}/api/safety?id=${encodeURIComponent(contractId)}`;
+  /**
+   * Build the unsigned set_flags() transaction XDR.
+   * Pass the returned string to your wallet's signTransaction() method,
+   * then call sendSignedXdr() with the result.
+   *
+   * No privileged key required — any funded Stellar account may submit flags.
+   */
+  async buildSubmitFlagsXdr(input: SubmitFlagsInput): Promise<string> {
+    const {
+      rpc,
+      Contract,
+      Address,
+      nativeToScVal,
+      xdr,
+      TransactionBuilder,
+      BASE_FEE,
+      Networks,
+    } = await import("@stellar/stellar-sdk");
 
-    const resp = await fetch(url, {
-      headers: { Accept: "application/json" },
-      // Don't cache in the SDK — callers control caching.
-      cache: "no-store",
-    });
+    const registryId = this._requireRegistryId();
+    const rpcUrl     = this.opts.rpcUrl ?? DEFAULT_RPC[this.opts.network];
+    const server     = new rpc.Server(rpcUrl, { allowHttp: false });
+    const contract   = new Contract(registryId);
+    const passphrase = this.opts.network === "mainnet" ? Networks.PUBLIC : Networks.TESTNET;
 
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string };
-      throw new Error(
-        `Report Card API error ${resp.status}: ${err?.error ?? resp.statusText}`
-      );
+    const account = await server.getAccount(input.submitterAddress);
+
+    // Pack the WASM hash into BytesN<32>.
+    const wasmHashBytes = Buffer.from(input.wasmHash, "hex");
+    if (wasmHashBytes.length !== 32) throw new Error("wasmHash must be 64 hex chars.");
+
+    const tx = new TransactionBuilder(account, {
+      fee:               BASE_FEE,
+      networkPassphrase: passphrase,
+    })
+      .addOperation(
+        contract.call(
+          "set_flags",
+          new Address(input.submitterAddress).toScVal(),
+          new Address(input.contractId).toScVal(),
+          xdr.ScVal.scvBytes(wasmHashBytes),
+          nativeToScVal(input.upgradeable,    { type: "bool" }),
+          nativeToScVal(input.sourceVerified, { type: "bool" }),
+          nativeToScVal(input.adminPower,     { type: "bool" }),
+          nativeToScVal(input.maturityScore,  { type: "u32"  }),
+        )
+      )
+      .setTimeout(30)
+      .build();
+
+    // Simulate to attach the resource footprint.
+    const sim = await server.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim)) {
+      throw new Error(`Simulation failed: ${sim.error}`);
     }
 
-    const data = await resp.json() as { contractId: string; record: Record<string, unknown> };
-    return this._normalise(contractId, data.record);
+    return rpc.assembleTransaction(tx, sim).build().toXDR();
   }
 
-  // ── RPC transport ───────────────────────────────────────────────────────
+  /**
+   * Submit a wallet-signed XDR and return the transaction hash.
+   */
+  async sendSignedXdr(signedXdr: string): Promise<string> {
+    const { rpc, TransactionBuilder, Networks } =
+      await import("@stellar/stellar-sdk");
+
+    const rpcUrl     = this.opts.rpcUrl ?? DEFAULT_RPC[this.opts.network];
+    const server     = new rpc.Server(rpcUrl, { allowHttp: false });
+    const passphrase = this.opts.network === "mainnet" ? Networks.PUBLIC : Networks.TESTNET;
+
+    const tx     = TransactionBuilder.fromXDR(signedXdr, passphrase);
+    const result = await server.sendTransaction(tx);
+
+    if (result.status === "ERROR") {
+      throw new Error(`Submit failed: ${JSON.stringify(result.errorResult)}`);
+    }
+
+    // Poll for confirmation.
+    let delay = 1_000;
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, delay));
+      const status = await server.getTransaction(result.hash);
+      if (status.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
+        if (status.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+          throw new Error(`Transaction failed: ${status.status}`);
+        }
+        return result.hash;
+      }
+      delay = Math.min(delay * 1.5, 8_000);
+    }
+
+    throw new Error(`Transaction ${result.hash} not confirmed after 15 attempts`);
+  }
+
+  // ── private: RPC read ─────────────────────────────────────────────────────
 
   private async _fetchRpc(contractId: string): Promise<SafetyResult> {
-    // Dynamically import @stellar/stellar-sdk so the SDK doesn't bundle it
-    // for callers who use the HTTP transport.
     const {
-      SorobanRpc,
+      rpc,           // v16 export — was SorobanRpc in v13
       Contract,
       Address,
       scValToNative,
@@ -161,102 +216,102 @@ export class ReportCard {
       Networks,
     } = await import("@stellar/stellar-sdk");
 
-    const registryId = this.opts.registryContractId;
-    if (!registryId) {
-      throw new Error(
-        "registryContractId is required when transport='rpc'. " +
-          "Pass it in the ReportCard constructor options."
-      );
-    }
+    const registryId = this._requireRegistryId();
+    const rpcUrl     = this.opts.rpcUrl ?? DEFAULT_RPC[this.opts.network];
+    const server     = new rpc.Server(rpcUrl, { allowHttp: false });
+    const contract   = new Contract(registryId);
+    const passphrase = this.opts.network === "mainnet" ? Networks.PUBLIC : Networks.TESTNET;
 
-    const rpcUrl = this.opts.rpcUrl ?? DEFAULT_RPC[this.opts.network];
-    const server = new SorobanRpc.Server(rpcUrl, { allowHttp: false });
-    const contract = new Contract(registryId);
-
-    const networkPassphrase =
-      this.opts.network === "mainnet" ? Networks.PUBLIC : Networks.TESTNET;
-
-    // Build a view transaction (no signing needed for read-only simulate).
-    const DUMMY = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
-    const account = new Account(DUMMY, "0");
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase,
+    // Read-only simulate — no signing, no fee.
+    const DUMMY  = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+    const tx = new TransactionBuilder(new Account(DUMMY, "0"), {
+      fee:               BASE_FEE,
+      networkPassphrase: passphrase,
     })
       .addOperation(contract.call("is_safe", new Address(contractId).toScVal()))
       .setTimeout(10)
       .build();
 
     const sim = await server.simulateTransaction(tx);
-    if (SorobanRpc.Api.isSimulationError(sim)) {
-      throw new Error(`Simulation error: ${sim.error}`);
-    }
-
-    if (!sim.result?.retval) {
-      // Contract returned nothing — treat as unknown (F).
-      return this._normalise(contractId, {});
-    }
+    if (rpc.Api.isSimulationError(sim)) throw new Error(`Simulation error: ${sim.error}`);
+    if (!sim.result?.retval) return this._normalise(contractId, {});
 
     const native = scValToNative(sim.result.retval) as Record<string, unknown>;
     return this._normalise(contractId, native);
   }
 
-  // ── normaliser ──────────────────────────────────────────────────────────
+  // ── private: HTTP read ────────────────────────────────────────────────────
 
-  private _normalise(
-    contractId: string,
-    raw: Record<string, unknown>
-  ): SafetyResult {
-    const grade = (raw["grade"] as Record<string, unknown>) ?? {};
-    const letter = (String(grade["letter"] ?? "F")) as GradeLetter;
-    const numeric = Number(grade["numeric"] ?? 1);
-    const score = Number(grade["score"] ?? 0);
-    const upgradeable = Boolean(raw["upgradeable"] ?? true);
-    const sourceVerified = Boolean(raw["source_verified"] ?? false);
-    const adminPower = Boolean(raw["admin_power"] ?? true);
+  private async _fetchHttp(contractId: string): Promise<SafetyResult> {
+    const base = (this.opts.apiUrl ?? "").replace(/\/$/, "");
+    const resp = await fetch(`${base}/api/safety?id=${encodeURIComponent(contractId)}`, {
+      headers: { Accept: "application/json" },
+      cache:   "no-store",
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      throw new Error(`Report Card API ${resp.status}: ${err?.error ?? resp.statusText}`);
+    }
+    const data = await resp.json() as { contractId: string; record: Record<string, unknown> };
+    return this._normalise(contractId, data.record);
+  }
+
+  // ── private: normalise ────────────────────────────────────────────────────
+
+  private _normalise(contractId: string, raw: Record<string, unknown>): SafetyResult {
+    const grade          = (raw["grade"] as Record<string, unknown>) ?? {};
+    const letter         = String(grade["letter"]  ?? "F") as GradeLetter;
+    const gradeNumeric   = Number(grade["numeric"] ?? 1)   as GradeNumeric;
+    const score          = Number(grade["score"]   ?? 0);
+    const upgradeable    = Boolean(raw["upgradeable"]      ?? true);
+    const sourceVerified = Boolean(raw["source_verified"]  ?? false);
+    const adminPower     = Boolean(raw["admin_power"]      ?? true);
     const attestationCount = Number(raw["attestation_count"] ?? 0);
-    const maturityScore = Number(raw["maturity_score"] ?? 0);
+    const maturityScore  = Number(raw["maturity_score"]    ?? 0);
 
     let wasmHash = "0".repeat(64);
     const wh = raw["wasm_hash"];
-    if (wh instanceof Uint8Array) {
-      wasmHash = Buffer.from(wh).toString("hex");
-    } else if (typeof wh === "string") {
-      wasmHash = wh;
-    }
+    if (wh instanceof Uint8Array) wasmHash = Buffer.from(wh).toString("hex");
+    else if (typeof wh === "string") wasmHash = wh;
 
-    // Build explanation.
     const parts: string[] = [];
-    if (upgradeable) parts.push("Admin can replace this code at any time.");
-    if (adminPower) parts.push("Dangerous admin functions present.");
-    if (!sourceVerified) parts.push("Source not verified.");
-    if (attestationCount === 0) parts.push("No audit attestations.");
-    const explanation =
-      parts.length > 0 ? parts.join(" ") : "All signals are healthy.";
+    if (upgradeable)    parts.push("Admin can replace this code at any time.");
+    if (adminPower)     parts.push("Dangerous admin functions present.");
+    if (!sourceVerified) parts.push("Source not verified against on-chain WASM.");
+    if (attestationCount === 0) parts.push("No audit attestations for this WASM hash.");
+    const explanation = parts.length > 0 ? parts.join(" ") : "All signals are healthy.";
 
     return {
-      contractId,
-      grade: letter,
-      gradeNumeric: numeric,
-      score,
-      upgradeable,
-      sourceVerified,
-      adminPower,
-      attestationCount,
-      wasmHash,
-      maturityScore,
-      explanation,
-      raw,
+      contractId, grade: letter, gradeNumeric, score,
+      upgradeable, sourceVerified, adminPower,
+      attestationCount, wasmHash, maturityScore,
+      explanation, raw,
     };
+  }
+
+  private _requireRegistryId(): string {
+    const id = this.opts.registryContractId;
+    if (!id) throw new Error("registryContractId is required. Pass it in ReportCardOptions.");
+    return id;
   }
 }
 
-// ─────────────────────────── convenience export ───────────────────────────────
+// ── convenience exports ───────────────────────────────────────────────────────
 
-/** Shorthand: single isSafe() call without constructing a class instance. */
 export async function isSafe(
   contractId: string,
-  options?: ReportCardOptions
+  options?:   ReportCardOptions,
 ): Promise<SafetyResult> {
   return new ReportCard(options).isSafe(contractId);
+}
+
+export async function submitFlags(
+  input:    SubmitFlagsInput,
+  signFn:   (xdr: string) => Promise<string>,
+  options?: ReportCardOptions,
+): Promise<string> {
+  const rc  = new ReportCard(options);
+  const xdr = await rc.buildSubmitFlagsXdr(input);
+  const signed = await signFn(xdr);
+  return rc.sendSignedXdr(signed);
 }

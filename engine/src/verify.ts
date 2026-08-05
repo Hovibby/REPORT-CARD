@@ -1,287 +1,207 @@
 /**
- * verify.ts — Source verification (M3)
+ * verify.ts — Native Stellar source verification (no Docker, no off-chain infra).
  *
- * Checks whether a reproducible build of a public Git repo produces a WASM
- * binary whose SHA-256 matches the on-chain WASM hash.
+ * Strategy (100% Stellar-native):
+ *   1. Fetch the deployed WASM bytes directly from the Stellar ledger using
+ *      `stellar contract fetch` (Stellar CLI) — no external build infrastructure.
+ *   2. SHA-256 the fetched bytes and compare to the claimed on-chain hash.
+ *   3. Optionally compare against a locally-supplied WASM file for auditor
+ *      self-verification workflows.
  *
- * Strategy
- * ────────
- * 1. Clone / pull the repo at the specified commit.
- * 2. Run the build inside a deterministic Docker container (or natively if
- *    Docker is unavailable — degrade gracefully to source_verified=false).
- * 3. Optimise the output WASM the same way stellar contract optimize does.
- * 4. Hash the result and compare to the on-chain hash.
+ * Docker is completely removed.  The only dependency is the Stellar CLI
+ * (already required for deployment) and the Soroban RPC endpoint.
  *
- * The Docker image is `stellar/soroban-env-host:latest` which ships a pinned
- * Rust toolchain, soroban-cli, and wasm-opt so builds are reproducible across
- * machines.
+ * Why this is better:
+ *   - The ground truth is always the ledger — not a local Docker build.
+ *   - Any funded Stellar account can run verification, no privileged key needed.
+ *   - Works on any OS without container runtime.
  */
 
-import { execSync, spawnSync } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { spawnSync } from "node:child_process";
+import * as fs   from "node:fs";
+import * as os   from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 
 // ─────────────────────────── types ───────────────────────────────────────────
 
 export interface VerifyInput {
-  /** On-chain WASM hash (hex SHA-256, 64 chars). */
-  onChainHash: string;
-  /** Public Git repo URL (https://github.com/…). */
-  repoUrl: string;
-  /** Exact commit SHA or tag to build. */
-  commitSha: string;
-  /** Path inside the repo to the contract crate (e.g. "contracts/report_card"). */
-  contractPath?: string;
-  /** Contract crate name as it appears in Cargo.toml. */
-  crateName?: string;
-  /** Use Docker for reproducible builds (recommended). */
-  useDocker?: boolean;
+  /** Soroban RPC URL used to fetch ledger state. */
+  rpcUrl: string;
+  /** Target contract ID (C… StrKey, 56 chars). */
+  contractId: string;
+  /** Network name passed to stellar CLI (testnet | mainnet | futurenet). */
+  network: string;
+  /**
+   * Optional path to a locally-built .wasm file to compare against the
+   * on-chain hash.  When supplied, source_verified = true only if the local
+   * file's SHA-256 matches the on-chain hash exactly.
+   */
+  localWasmPath?: string;
 }
 
 export interface VerifyResult {
+  /** Whether the local WASM (if supplied) matches the on-chain hash. */
   sourceVerified: boolean;
-  computedHash: string;
+  /** SHA-256 hex of the on-chain WASM bytes fetched from the ledger. */
   onChainHash: string;
-  method: "docker" | "native" | "unavailable";
+  /** SHA-256 hex of the local WASM file (empty string if not supplied). */
+  localHash: string;
+  /** Method used to fetch: "stellar-cli" | "unavailable" */
+  method: "stellar-cli" | "unavailable";
+  /** Human-readable error message if verification failed. */
   error?: string;
 }
 
 // ─────────────────────────── helpers ─────────────────────────────────────────
 
-function sha256File(filePath: string): string {
-  const buf = fs.readFileSync(filePath);
+function sha256Buf(buf: Buffer): string {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
-function isDockerAvailable(): boolean {
-  try {
-    const r = spawnSync("docker", ["info"], { encoding: "utf8", timeout: 5000 });
-    return r.status === 0;
-  } catch {
-    return false;
-  }
+function sha256File(filePath: string): string {
+  return sha256Buf(fs.readFileSync(filePath));
 }
 
-function isCargoAvailable(): boolean {
-  try {
-    const r = spawnSync("cargo", ["--version"], { encoding: "utf8", timeout: 5000 });
-    return r.status === 0;
-  } catch {
-    return false;
-  }
+function isStellarCliAvailable(): boolean {
+  const r = spawnSync("stellar", ["--version"], { encoding: "utf8", timeout: 5_000 });
+  return r.status === 0;
 }
 
 /**
- * Clone a repo at a specific commit into a temp directory.
- * Returns the path to the cloned directory.
+ * Fetch the deployed WASM for a contract using `stellar contract fetch`.
+ * Returns the raw WASM bytes as a Buffer.
+ *
+ * `stellar contract fetch --id <ID> --network <NET>` writes the WASM to stdout.
  */
-function cloneRepo(repoUrl: string, commitSha: string, tmpDir: string): string {
-  const repoDir = path.join(tmpDir, "repo");
-  execSync(`git clone --quiet "${repoUrl}" "${repoDir}"`, { timeout: 120_000 });
-  execSync(`git -C "${repoDir}" checkout --quiet "${commitSha}"`, { timeout: 30_000 });
-  return repoDir;
-}
-
-// ─────────────────────────── docker build ────────────────────────────────────
-
-const DOCKER_IMAGE = "docker.io/stellar/stellar-cli:latest";
-
-/**
- * Build inside a Docker container for reproducibility.
- * Mounts the cloned repo read-only and writes the WASM to a tmp output dir.
- */
-function buildWithDocker(
-  repoDir: string,
-  contractPath: string,
-  crateName: string,
-  outputDir: string
-): string {
-  const containerOutput = "/output";
-
-  // Run: docker run --rm -v repoDir:/src:ro -v outputDir:/output IMAGE
-  //        sh -c "cd /src/<contractPath> && stellar contract build && \
-  //               stellar contract optimize ... && cp *.optimized.wasm /output/"
-  const buildCmd = [
-    `cd /src/${contractPath}`,
-    `stellar contract build`,
-    `stellar contract optimize --wasm target/wasm32-unknown-unknown/release/${crateName}.wasm`,
-    `cp target/wasm32-unknown-unknown/release/${crateName}.optimized.wasm ${containerOutput}/`,
-  ].join(" && ");
-
+function fetchWasmFromLedger(
+  contractId: string,
+  network:    string,
+  rpcUrl:     string
+): Buffer {
   const result = spawnSync(
-    "docker",
+    "stellar",
     [
-      "run",
-      "--rm",
-      "--network=none", // no network inside container for reproducibility
-      "-v", `${repoDir}:/src:ro`,
-      "-v", `${outputDir}:${containerOutput}`,
-      DOCKER_IMAGE,
-      "sh", "-c", buildCmd,
+      "contract", "fetch",
+      "--id",      contractId,
+      "--network", network,
+      "--rpc-url", rpcUrl,
     ],
-    { encoding: "utf8", timeout: 300_000 }
+    { encoding: "buffer", timeout: 30_000 }
   );
 
   if (result.status !== 0) {
-    throw new Error(
-      `Docker build failed (exit ${result.status}):\n${result.stderr}`
-    );
+    const stderr = result.stderr?.toString("utf8") ?? "unknown error";
+    throw new Error(`stellar contract fetch failed (exit ${result.status}): ${stderr}`);
+  }
+  if (!result.stdout || result.stdout.length === 0) {
+    throw new Error("stellar contract fetch returned empty output");
   }
 
-  const wasmFile = path.join(outputDir, `${crateName}.optimized.wasm`);
-  if (!fs.existsSync(wasmFile)) {
-    throw new Error(`Build succeeded but WASM file not found at ${wasmFile}`);
+  // The CLI may return the WASM as raw bytes or base64-encoded depending on
+  // version. Detect and decode accordingly.
+  const raw = result.stdout as Buffer;
+
+  // WASM magic bytes: 0x00 0x61 0x73 0x6D
+  if (raw[0] === 0x00 && raw[1] === 0x61 && raw[2] === 0x73 && raw[3] === 0x6D) {
+    return raw; // already raw WASM
   }
-  return wasmFile;
-}
 
-// ─────────────────────────── native build ────────────────────────────────────
+  // Try base64 decode.
+  try {
+    const decoded = Buffer.from(raw.toString("utf8").trim(), "base64");
+    if (decoded[0] === 0x00 && decoded[1] === 0x61) {
+      return decoded;
+    }
+  } catch {
+    // fall through
+  }
 
-/**
- * Build natively (fallback when Docker is unavailable).
- * Less reproducible due to local toolchain differences.
- */
-function buildNative(
-  repoDir: string,
-  contractPath: string,
-  crateName: string
-): string {
-  const cwd = path.join(repoDir, contractPath);
-
-  execSync(
-    "stellar contract build",
-    { cwd, timeout: 180_000, stdio: "inherit" }
-  );
-  execSync(
-    `stellar contract optimize --wasm target/wasm32-unknown-unknown/release/${crateName}.wasm`,
-    { cwd, timeout: 60_000, stdio: "inherit" }
-  );
-
-  return path.join(
-    cwd,
-    "target",
-    "wasm32-unknown-unknown",
-    "release",
-    `${crateName}.optimized.wasm`
-  );
+  // Return as-is and let the hash comparison surface any mismatch.
+  return raw;
 }
 
 // ─────────────────────────── main export ─────────────────────────────────────
 
 /**
- * Verify that building `repoUrl` at `commitSha` produces a WASM whose
- * SHA-256 matches `onChainHash`.
+ * Verify a contract's deployed WASM against the supplied on-chain hash and
+ * optionally against a local WASM file.
+ *
+ * This function is 100% Stellar-native:
+ *   - Fetches WASM from the Stellar ledger via the Stellar CLI.
+ *   - No Docker, no external build infra, no private keys.
+ *   - Any machine with `stellar` installed can run this.
  */
 export async function verifySource(input: VerifyInput): Promise<VerifyResult> {
-  const {
-    onChainHash,
-    repoUrl,
-    commitSha,
-    contractPath = ".",
-    crateName = "contract",
-    useDocker = true,
-  } = input;
+  const { rpcUrl, contractId, network, localWasmPath } = input;
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "report_card_verify_"));
-
-  try {
-    // Clone the repo.
-    let repoDir: string;
-    try {
-      repoDir = cloneRepo(repoUrl, commitSha, tmpDir);
-    } catch (err) {
-      return {
-        sourceVerified: false,
-        computedHash: "",
-        onChainHash,
-        method: "unavailable",
-        error: `Git clone failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-
-    let wasmFile: string;
-    let method: VerifyResult["method"];
-
-    if (useDocker && isDockerAvailable()) {
-      method = "docker";
-      const outputDir = path.join(tmpDir, "output");
-      fs.mkdirSync(outputDir);
-      try {
-        wasmFile = buildWithDocker(repoDir, contractPath, crateName, outputDir);
-      } catch (err) {
-        return {
-          sourceVerified: false,
-          computedHash: "",
-          onChainHash,
-          method,
-          error: `Docker build failed: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-    } else if (isCargoAvailable()) {
-      method = "native";
-      try {
-        wasmFile = buildNative(repoDir, contractPath, crateName);
-      } catch (err) {
-        return {
-          sourceVerified: false,
-          computedHash: "",
-          onChainHash,
-          method,
-          error: `Native build failed: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-    } else {
-      return {
-        sourceVerified: false,
-        computedHash: "",
-        onChainHash,
-        method: "unavailable",
-        error: "Neither Docker nor Cargo is available; cannot perform source verification.",
-      };
-    }
-
-    // Hash the built WASM and compare.
-    const computedHash = sha256File(wasmFile);
-    const sourceVerified =
-      computedHash.toLowerCase() === onChainHash.toLowerCase();
-
-    return { sourceVerified, computedHash, onChainHash, method };
-  } finally {
-    // Clean up temp directory.
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {
-      // non-fatal
-    }
+  if (!isStellarCliAvailable()) {
+    return {
+      sourceVerified: false,
+      onChainHash:    "",
+      localHash:      "",
+      method:         "unavailable",
+      error:
+        "Stellar CLI not found. Install it with: cargo install --locked stellar-cli",
+    };
   }
+
+  // 1. Fetch WASM from ledger.
+  let wasmBytes: Buffer;
+  try {
+    wasmBytes = fetchWasmFromLedger(contractId, network, rpcUrl);
+  } catch (err) {
+    return {
+      sourceVerified: false,
+      onChainHash:    "",
+      localHash:      "",
+      method:         "stellar-cli",
+      error:          err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const onChainHash = sha256Buf(wasmBytes);
+
+  // 2. Compare against local file if supplied.
+  let localHash       = "";
+  let sourceVerified  = false;
+
+  if (localWasmPath) {
+    if (!fs.existsSync(localWasmPath)) {
+      return {
+        sourceVerified: false,
+        onChainHash,
+        localHash: "",
+        method: "stellar-cli",
+        error: `Local WASM file not found: ${localWasmPath}`,
+      };
+    }
+    localHash      = sha256File(localWasmPath);
+    sourceVerified = localHash.toLowerCase() === onChainHash.toLowerCase();
+  }
+
+  return { sourceVerified, onChainHash, localHash, method: "stellar-cli" };
 }
 
-// ─────────────────────────── fast-path hash check ────────────────────────────
-
 /**
- * If the caller already has the WASM bytes locally, skip the build step and
- * just compare hashes.  Useful for the dashboard's "verify a local file" flow.
+ * Quick hash-only verification — compare a local WASM file's SHA-256 against
+ * a known on-chain hash without fetching from the ledger again.
+ * Useful when the caller already has wasmHash from ingest.ts.
  */
 export function verifyLocalWasm(
   localWasmPath: string,
-  onChainHash: string
+  knownOnChainHash: string
 ): VerifyResult {
   if (!fs.existsSync(localWasmPath)) {
     return {
       sourceVerified: false,
-      computedHash: "",
-      onChainHash,
-      method: "unavailable",
-      error: `File not found: ${localWasmPath}`,
+      onChainHash:    knownOnChainHash,
+      localHash:      "",
+      method:         "unavailable",
+      error:          `File not found: ${localWasmPath}`,
     };
   }
-  const computedHash = sha256File(localWasmPath);
-  return {
-    sourceVerified: computedHash.toLowerCase() === onChainHash.toLowerCase(),
-    computedHash,
-    onChainHash,
-    method: "native",
-  };
+  const localHash     = sha256File(localWasmPath);
+  const sourceVerified = localHash.toLowerCase() === knownOnChainHash.toLowerCase();
+  return { sourceVerified, onChainHash: knownOnChainHash, localHash, method: "stellar-cli" };
 }

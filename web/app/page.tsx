@@ -19,7 +19,7 @@ export default function HomePage() {
           </span>
         </div>
         <a
-          href="https://github.com/your-org/report_card"
+          href="https://github.com/Hovibby/REPORT-CARD"
           target="_blank"
           rel="noreferrer"
           className="text-sm text-slate-400 hover:text-slate-200 transition-colors"
@@ -40,11 +40,12 @@ export default function HomePage() {
         >
           Before your wallet signs,
           <br />
-          <span className="text-brand-500">ask is_safe(contract)</span>
+          <span className="text-sky-400">ask is_safe(contract)</span>
         </h1>
         <p className="max-w-xl text-slate-400 text-lg">
-          Audit attestations · WASM analysis · source verification — fused into
-          one A–F grade any wallet or contract can read on-chain.
+          Fully on-chain safety registry — no admin keys, no privileged relayers.
+          Audit attestations · WASM analysis · source verification fused into
+          one A–F grade any wallet or contract can read permissionlessly.
         </p>
 
         {/* Search */}
@@ -82,7 +83,15 @@ export default function HomePage() {
 
       {/* ── Footer ───────────────────────────────────────────────── */}
       <footer className="mt-auto border-t border-slate-800 px-6 py-6 text-center text-xs text-slate-500">
-        Apache-2.0 · data CC-BY-4.0 · Project 3 of 5, Stellar Trust-Oracle Suite
+        Apache-2.0 · data CC-BY-4.0 · Stellar Trust-Oracle Suite ·{" "}
+        <a
+          href="https://github.com/Hovibby/REPORT-CARD"
+          target="_blank"
+          rel="noreferrer"
+          className="hover:text-slate-300 transition-colors"
+        >
+          GitHub
+        </a>
       </footer>
     </main>
   );

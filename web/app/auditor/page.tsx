@@ -98,6 +98,8 @@ export default function AuditorPage() {
         <h1 className="text-2xl font-bold">Auditor Portal</h1>
         <p className="text-slate-400 text-sm mt-1">
           Submit a signed attestation bound to a specific WASM hash.
+          Any registered auditor may attest — no admin approval required.
+          Reputation is set by the on-chain governance council.
         </p>
       </div>
 

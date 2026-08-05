@@ -4,10 +4,10 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Report Card — Soroban Contract Safety Registry",
   description:
-    "Before your wallet signs, ask is_safe(contract). Audit attestations + WASM analysis + source verification fused into one A–F grade.",
+    "Fully decentralised safety registry for Soroban smart contracts. No admin keys, no privileged relayers. is_safe(contract) returns an A–F grade backed by on-chain attestations, WASM analysis, and source verification.",
   openGraph: {
-    title: "Report Card",
-    description: "Safety registry for Soroban smart contracts.",
+    title: "Report Card — Soroban Safety Registry",
+    description: "Permissionless on-chain safety grades for Soroban smart contracts.",
     type: "website",
   },
 };

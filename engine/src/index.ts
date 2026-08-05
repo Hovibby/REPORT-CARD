@@ -1,73 +1,81 @@
 /**
- * index.ts — Engine scheduler / entrypoint
+ * index.ts — Permissionless engine scheduler / entrypoint.
  *
- * Runs the full analysis pipeline for a list of contracts:
- *   ingest → analyse WASM → verify source → score → relay verdict on-chain
+ * DECENTRALISATION:
+ *   - No RELAYER_SECRET required.  Any funded Stellar account can submit flags.
+ *   - No Docker.  Source verification uses `stellar contract fetch` to pull
+ *     WASM directly from the ledger and hash it.
+ *   - The engine is a stateless observer: it reads from Stellar, computes
+ *     analysis, and writes back to Stellar.  No database, no off-chain store.
  *
  * Usage:
- *   pnpm start                         # process contracts in data/contracts.json
- *   pnpm start -- --contract <ID>      # process a single contract
- *   pnpm start -- --once               # run once and exit (no scheduler loop)
+ *   node dist/index.js                    # process all contracts in data/contracts.json
+ *   node dist/index.js --contract <ID>    # single contract
+ *   node dist/index.js --once             # run once and exit
  */
 
-import * as fs from "node:fs";
+import * as fs   from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+
 import { fetchWasm, fetchContractMeta, TESTNET_CONFIG, MAINNET_CONFIG } from "./ingest.js";
 import { analyzeWasm, computeScore } from "./scoring.js";
-import { verifySource } from "./verify.js";
-import { Relayer } from "./relayer.js";
+import { verifySource }              from "./verify.js";
+import { Relayer }                   from "./relayer.js";
 import type { StellarNetwork, NetworkConfig } from "@reportcard/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ─────────────────────────── config ──────────────────────────────────────────
+// ─────────────────────────── types ───────────────────────────────────────────
 
 interface ContractEntry {
-  contractId: string;
-  repoUrl?: string;
-  commitSha?: string;
-  contractPath?: string;
-  crateName?: string;
+  contractId:    string;
+  /** Optional path to a locally-built WASM for source verification. */
+  localWasmPath?: string;
 }
 
 interface EngineConfig {
-  network: StellarNetwork;
-  relayerSecret: string;
+  network:            StellarNetwork;
+  /**
+   * Optional: secret key of ANY funded Stellar account.
+   * Not a privileged key — just pays the transaction fee.
+   * If unset the engine runs in dry-run mode.
+   */
+  submitterSecret:    string;
   registryContractId: string;
-  intervalMs: number;
-  sorobanRpcUrl: string;       // from env: SOROBAN_RPC_URL
-  horizonUrl: string;          // from env: HORIZON_URL
-  contracts: ContractEntry[];
+  intervalMs:         number;
+  sorobanRpcUrl:      string;
+  horizonUrl:         string;
+  contracts:          ContractEntry[];
 }
 
-function loadConfig(): EngineConfig {
-  const network =
-    (process.env["STELLAR_NETWORK"] as StellarNetwork) ?? "testnet";
-  const relayerSecret = process.env["RELAYER_SECRET"] ?? "";
-  const registryContractId = process.env["REGISTRY_CONTRACT_ID"] ?? "";
-  const intervalMs = parseInt(process.env["ENGINE_INTERVAL_MS"] ?? "300000", 10);
+// ─────────────────────────── config ──────────────────────────────────────────
 
-  // Override RPC/Horizon endpoints from env, falling back to the shared defaults.
-  const defaultNet = network === "mainnet" ? MAINNET_CONFIG : TESTNET_CONFIG;
+function loadConfig(): EngineConfig {
+  const network = (process.env["STELLAR_NETWORK"] as StellarNetwork) ?? "testnet";
+
+  const defaultNet  = network === "mainnet" ? MAINNET_CONFIG : TESTNET_CONFIG;
   const sorobanRpcUrl = process.env["SOROBAN_RPC_URL"] ?? defaultNet.rpcUrl;
   const horizonUrl    = process.env["HORIZON_URL"]     ?? defaultNet.horizonUrl;
 
-  if (!relayerSecret || !registryContractId) {
+  // SUBMITTER_SECRET replaces the old RELAYER_SECRET.
+  // It is NOT a privileged key — any funded account works.
+  const submitterSecret    = process.env["SUBMITTER_SECRET"]    ?? "";
+  const registryContractId = process.env["REGISTRY_CONTRACT_ID"] ?? "";
+
+  if (!submitterSecret || !registryContractId) {
     console.warn(
-      "[engine] RELAYER_SECRET or REGISTRY_CONTRACT_ID not set — " +
-        "will run in dry-run mode (no on-chain writes)."
+      "[engine] SUBMITTER_SECRET or REGISTRY_CONTRACT_ID not set — " +
+        "running in dry-run mode (analysis only, no on-chain writes)."
     );
   }
 
-  // Load contract list from data/contracts.json (relative to project root).
   const dataPath = path.resolve(__dirname, "../../data/contracts.json");
   let contracts: ContractEntry[] = [];
   if (fs.existsSync(dataPath)) {
     contracts = JSON.parse(fs.readFileSync(dataPath, "utf8")) as ContractEntry[];
   }
 
-  // CLI override: --contract <ID>
   const cliIdx = process.argv.indexOf("--contract");
   if (cliIdx !== -1 && process.argv[cliIdx + 1]) {
     contracts = [{ contractId: process.argv[cliIdx + 1]! }];
@@ -75,9 +83,9 @@ function loadConfig(): EngineConfig {
 
   return {
     network,
-    relayerSecret,
+    submitterSecret,
     registryContractId,
-    intervalMs,
+    intervalMs: parseInt(process.env["ENGINE_INTERVAL_MS"] ?? "300000", 10),
     sorobanRpcUrl,
     horizonUrl,
     contracts,
@@ -87,14 +95,12 @@ function loadConfig(): EngineConfig {
 // ─────────────────────────── pipeline ────────────────────────────────────────
 
 async function analyseContract(
-  entry: ContractEntry,
-  config: EngineConfig,
+  entry:   ContractEntry,
+  config:  EngineConfig,
   relayer: Relayer | null
 ): Promise<void> {
   const { contractId } = entry;
 
-  // Build a NetworkConfig from the resolved env values so every downstream
-  // call uses the same endpoints (not the hardcoded TESTNET_CONFIG defaults).
   const netConfig: NetworkConfig = {
     rpcUrl:            config.sorobanRpcUrl,
     horizonUrl:        config.horizonUrl,
@@ -105,70 +111,66 @@ async function analyseContract(
         : "Test SDF Network ; September 2015",
   };
 
-  console.log(`[engine] Analysing ${contractId} …`);
+  console.log(`\n[engine] ── Analysing ${contractId} ──`);
 
-  // 1. Fetch WASM
+  // 1. Fetch WASM from ledger via Soroban RPC.
   let wasmInfo: Awaited<ReturnType<typeof fetchWasm>>;
   try {
     wasmInfo = await fetchWasm(contractId, netConfig);
-    console.log(
-      `  WASM fetched: ${wasmInfo.wasmSize} bytes, hash=${wasmInfo.wasmHash.slice(0, 16)}…`
-    );
+    console.log(`  WASM: ${wasmInfo.wasmSize} bytes  hash=${wasmInfo.wasmHash.slice(0, 16)}…`);
   } catch (err) {
     console.error(`  [SKIP] WASM fetch failed: ${err}`);
     return;
   }
 
-  // 2. Static WASM analysis
+  // 2. Static WASM analysis (byte-pattern detection — no runtime execution).
   const analysis = analyzeWasm(wasmInfo.wasmBytes);
   console.log(
-    `  upgradeable=${analysis.upgradeable}, adminPower=${analysis.adminPower}, ` +
-      `hostFunctions=[${analysis.hostFunctions.join(", ")}]`
+    `  upgradeable=${analysis.upgradeable}  adminPower=${analysis.adminPower}` +
+    `  hostFns=[${analysis.hostFunctions.slice(0, 4).join(", ")}${analysis.hostFunctions.length > 4 ? "…" : ""}]`
   );
-  if (analysis.warnings.length) {
-    analysis.warnings.forEach((w) => console.warn(`  ⚠  ${w}`));
-  }
+  analysis.warnings.forEach(w => console.warn(`  ⚠  ${w}`));
 
-  // 3. Fetch contract metadata (Horizon)
-  const meta = await fetchContractMeta(contractId, netConfig).catch(() => null);
+  // 3. Fetch Horizon metadata for maturity scoring.
+  const meta    = await fetchContractMeta(contractId, netConfig).catch(() => null);
   const ageDays = meta
     ? Math.floor((Date.now() / 1000 - meta.createdAtTimestamp) / 86400)
     : 0;
 
-  // 4. Source verification (optional — only if repoUrl + commitSha provided)
+  // 4. Source verification — Stellar-native: fetch WASM from ledger and hash it.
+  //    If a localWasmPath is provided, compare the local build to the on-chain hash.
+  //    No Docker, no external build infra.
   let sourceVerified = false;
-  if (entry.repoUrl && entry.commitSha) {
-    console.log(`  Verifying source: ${entry.repoUrl}@${entry.commitSha} …`);
+  if (entry.localWasmPath) {
+    console.log(`  Verifying source against local WASM: ${entry.localWasmPath}`);
     const vr = await verifySource({
-      onChainHash: wasmInfo.wasmHash,
-      repoUrl: entry.repoUrl,
-      commitSha: entry.commitSha,
-      contractPath: entry.contractPath,
-      crateName: entry.crateName,
-      useDocker: true,
+      rpcUrl:        config.sorobanRpcUrl,
+      contractId,
+      network:       config.network,
+      localWasmPath: entry.localWasmPath,
     });
     sourceVerified = vr.sourceVerified;
     console.log(
-      `  source_verified=${vr.sourceVerified} (method=${vr.method})` +
-        (vr.error ? ` error=${vr.error}` : "")
+      `  source_verified=${vr.sourceVerified}  method=${vr.method}` +
+      (vr.error ? `  error=${vr.error}` : "")
     );
+  } else {
+    console.log("  No localWasmPath provided — skipping source verification.");
   }
 
-  // 5. Compute score (dry-run / logging — on-chain grade is computed by the contract)
-  const scoreResult = computeScore({
-    attestations: [],           // on-chain attestations not fetched here; contract does this
+  // 5. Score computation (dry-run log — on-chain grade is recomputed by contract).
+  const score = computeScore({
+    attestations:     [],
     sourceVerified,
-    upgradeable: analysis.upgradeable,
-    adminPower: analysis.adminPower,
+    upgradeable:      analysis.upgradeable,
+    adminPower:       analysis.adminPower,
     ageDays,
     distinctAccounts: meta?.distinctAccounts ?? 0,
-    tvlProxy: meta?.tvlProxy ?? 0,
+    tvlProxy:         meta?.tvlProxy ?? 0,
   });
-  console.log(
-    `  Computed grade: ${scoreResult.grade} (score=${scoreResult.score}) — ${scoreResult.explanation}`
-  );
+  console.log(`  Grade preview: ${score.grade} (score=${score.score})  ${score.explanation}`);
 
-  // 6. Submit verdict on-chain
+  // 6. Submit verdict on-chain — permissionless, no privileged key.
   if (relayer) {
     const result = await relayer.submitVerdict(
       contractId,
@@ -177,17 +179,17 @@ async function analyseContract(
       sourceVerified,
       ageDays,
       meta?.distinctAccounts ?? 0,
-      meta?.tvlProxy ?? 0
+      meta?.tvlProxy ?? 0,
     );
     if (result.success) {
-      console.log(`  ✓ Verdict written on-chain: txHash=${result.txHash}`);
+      console.log(`  ✓ Flags written on-chain  txHash=${result.txHash}`);
+    } else if (result.error?.startsWith("UNSIGNED_XDR:")) {
+      console.log("  ⚡ Unsigned XDR returned — sign and submit via wallet.");
     } else {
-      console.error(`  ✗ Relayer error: ${result.error}`);
+      console.error(`  ✗ Submit error: ${result.error}`);
     }
   } else {
-    console.log(
-      "  [dry-run] No RELAYER_SECRET — skipping on-chain write."
-    );
+    console.log("  [dry-run] No SUBMITTER_SECRET — skipping on-chain write.");
   }
 }
 
@@ -195,47 +197,47 @@ async function analyseContract(
 
 async function runOnce(config: EngineConfig, relayer: Relayer | null): Promise<void> {
   if (config.contracts.length === 0) {
-    console.warn("[engine] No contracts to analyse. Add entries to data/contracts.json.");
+    console.warn("[engine] No contracts to analyse — add entries to data/contracts.json.");
     return;
   }
-
   for (const entry of config.contracts) {
-    await analyseContract(entry, config, relayer).catch((err) =>
-      console.error(`[engine] Unhandled error for ${entry.contractId}: ${err}`)
+    await analyseContract(entry, config, relayer).catch(err =>
+      console.error(`[engine] Error for ${entry.contractId}: ${err}`)
     );
   }
 }
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  const once = process.argv.includes("--once");
+  const once   = process.argv.includes("--once");
 
   const relayer =
-    config.relayerSecret && config.registryContractId
+    config.submitterSecret && config.registryContractId
       ? new Relayer({
-          secretKey: config.relayerSecret,
+          secretKey:  config.submitterSecret,
           contractId: config.registryContractId,
-          rpcUrl: config.sorobanRpcUrl,
-          network: config.network,
+          rpcUrl:     config.sorobanRpcUrl,
+          network:    config.network,
         })
       : null;
 
   console.log(
-    `[engine] Starting Report Card engine (network=${config.network}, ` +
-      `contracts=${config.contracts.length}, dry-run=${relayer === null})`
+    `[engine] Report Card engine started\n` +
+    `  network   = ${config.network}\n` +
+    `  contracts = ${config.contracts.length}\n` +
+    `  dry-run   = ${relayer === null}\n` +
+    `  rpc       = ${config.sorobanRpcUrl}`
   );
 
   await runOnce(config, relayer);
 
   if (!once) {
-    setInterval(() => {
-      runOnce(config, relayer).catch(console.error);
-    }, config.intervalMs);
-    console.log(`[engine] Scheduler started — interval=${config.intervalMs}ms`);
+    setInterval(() => runOnce(config, relayer).catch(console.error), config.intervalMs);
+    console.log(`[engine] Scheduler running — interval=${config.intervalMs}ms`);
   }
 }
 
-main().catch((err) => {
+main().catch(err => {
   console.error("[engine] Fatal:", err);
   process.exit(1);
 });
